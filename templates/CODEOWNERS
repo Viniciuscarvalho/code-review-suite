@@ -1,0 +1,15 @@
+# Human owners only. Do not list a bot. A bot approval never counts.
+# Replace @org/owners with the team that must review these paths.
+
+/.github/workflows/ @org/owners
+/.github/actions/ @org/owners
+/.github/CODEOWNERS @org/owners
+
+/auth/ @org/owners
+/billing/ @org/owners
+/payments/ @org/owners
+
+# GitHub CODEOWNERS has no recursive glob beyond a trailing slash.
+# Add a line for each migrations directory you actually have.
+/db/migrations/ @org/owners
+/prisma/migrations/ @org/owners

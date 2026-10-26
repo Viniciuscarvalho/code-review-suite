@@ -1,0 +1,355 @@
+name: Review
+
+on:
+  workflow_call:
+    inputs:
+      cheap_model:
+        description: Model for a low-risk review.
+        required: false
+        type: string
+        default: claude-haiku-5-5
+      strong_model:
+        description: Model for a med or high-risk review.
+        required: false
+        type: string
+        default: claude-sonnet-5-5
+      max_cycles:
+        description: Maximum model review cycles. The next run stops.
+        required: false
+        type: number
+        default: 3
+      voting:
+        description: Second model pass that confirms findings. Off by default.
+        required: false
+        type: boolean
+        default: false
+      review_drafts:
+        description: Run the model on draft pull requests.
+        required: false
+        type: boolean
+        default: false
+      allowed_bots:
+        description: Bot logins that may trigger the model, comma-separated. Empty allows humans only.
+        required: false
+        type: string
+        default: ""
+      require_checks:
+        description: Fail tier 0 when lint, typecheck, test, or build was skipped.
+        required: false
+        type: boolean
+        default: false
+      lint_command:
+        description: Override lint. Empty auto-detects. "skip" disables it.
+        required: false
+        type: string
+        default: ""
+      typecheck_command:
+        description: Override typecheck. Empty auto-detects. "skip" disables it.
+        required: false
+        type: string
+        default: ""
+      test_command:
+        description: Override tests. Empty auto-detects. "skip" disables it.
+        required: false
+        type: string
+        default: ""
+      build_command:
+        description: Override build. Empty auto-detects. "skip" disables it.
+        required: false
+        type: string
+        default: ""
+      install_command:
+        description: Override install. Empty auto-detects. "skip" disables it.
+        required: false
+        type: string
+        default: ""
+      base_ref:
+        description: Git ref to diff against. Empty uses the pull request base.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+
+# A caller that does not set permissions inherits these.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+  id-token: write
+
+concurrency:
+  group: code-review-suite-${{ github.repository }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  tier0:
+    name: tier0
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      risk: ${{ steps.classify.outputs.risk }}
+      sensitive: ${{ steps.classify.outputs.sensitive }}
+      lines: ${{ steps.classify.outputs.lines }}
+      files: ${{ steps.classify.outputs.files }}
+      human_required: ${{ steps.classify.outputs.human_required }}
+      reasons: ${{ steps.classify.outputs.reasons }}
+      mode: ${{ steps.decide.outputs.mode }}
+      reason: ${{ steps.decide.outputs.reason }}
+      model: ${{ steps.decide.outputs.model }}
+      max_turns: ${{ steps.decide.outputs.max_turns }}
+      security: ${{ steps.decide.outputs.security }}
+      cycle: ${{ steps.decide.outputs.cycle }}
+      base_sha: ${{ steps.decide.outputs.base_sha }}
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$BASE_BRANCH" ]]; then
+            git fetch --no-tags origin "$BASE_BRANCH"
+          fi
+
+      - name: Locate review suite
+        id: suite
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          ref="${WORKFLOW_REF##*@}"
+          rest="${WORKFLOW_REF%@*}"
+          repo="$(printf '%s\n' "$rest" | cut -d/ -f1-2)"
+          if [[ -z "$repo" || -z "$ref" || "$repo" != */* ]]; then
+            echo "Could not parse the suite location from WORKFLOW_REF" >&2
+            exit 1
+          fi
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout review suite
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.suite.outputs.repo }}
+          ref: ${{ steps.suite.outputs.ref }}
+          path: .code-review-suite
+          persist-credentials: false
+
+      - name: Lint, typecheck, test, and build
+        env:
+          LINT_CMD: ${{ inputs.lint_command }}
+          TYPECHECK_CMD: ${{ inputs.typecheck_command }}
+          TEST_CMD: ${{ inputs.test_command }}
+          BUILD_CMD: ${{ inputs.build_command }}
+          INSTALL_CMD: ${{ inputs.install_command }}
+          REQUIRE_CHECKS: ${{ inputs.require_checks }}
+        run: bash .code-review-suite/scripts/tier0.sh
+
+      - name: Classify risk
+        id: classify
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+        run: bash .code-review-suite/scripts/risk-classify.sh --github-output
+
+      - name: Fetch prior review comments
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash .code-review-suite/scripts/fetch-review-comments.sh > prior-comments.txt
+
+      - name: Check API key
+        id: key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${ANTHROPIC_API_KEY}" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Choose tier
+        id: decide
+        env:
+          KEY_PRESENT: ${{ steps.key.outputs.present }}
+          RISK: ${{ steps.classify.outputs.risk }}
+          SENSITIVE: ${{ steps.classify.outputs.sensitive }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          MAX_CYCLES: ${{ inputs.max_cycles }}
+          REVIEW_DRAFTS: ${{ inputs.review_drafts }}
+          CHEAP_MODEL: ${{ inputs.cheap_model }}
+          STRONG_MODEL: ${{ inputs.strong_model }}
+          COMMENTS_FILE: prior-comments.txt
+        run: bash .code-review-suite/scripts/plan-review.sh
+
+  llm:
+    name: llm
+    needs: tier0
+    if: ${{ !cancelled() && needs.tier0.result == 'success' && (needs.tier0.outputs.mode == 'quick' || needs.tier0.outputs.mode == 'deep') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Locate review suite
+        id: suite
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          ref="${WORKFLOW_REF##*@}"
+          rest="${WORKFLOW_REF%@*}"
+          repo="$(printf '%s\n' "$rest" | cut -d/ -f1-2)"
+          if [[ -z "$repo" || -z "$ref" || "$repo" != */* ]]; then
+            echo "Could not parse the suite location from WORKFLOW_REF" >&2
+            exit 1
+          fi
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout review suite
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.suite.outputs.repo }}
+          ref: ${{ steps.suite.outputs.ref }}
+          path: .code-review-suite
+          persist-credentials: false
+
+      - name: Hide suite files from git status
+        run: |
+          set -euo pipefail
+          mkdir -p .git/info
+          echo ".code-review-suite/" >> .git/info/exclude
+
+      - name: Build review prompt
+        id: prompt
+        env:
+          MODE: ${{ needs.tier0.outputs.mode }}
+          SECURITY: ${{ needs.tier0.outputs.security }}
+          CYCLE: ${{ needs.tier0.outputs.cycle }}
+          MAX_CYCLES: ${{ inputs.max_cycles }}
+          DIFF_BASE: ${{ needs.tier0.outputs.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          {
+            echo "text<<REVIEW_SUITE_PROMPT_END"
+            bash .code-review-suite/scripts/build-prompt.sh
+            echo "REVIEW_SUITE_PROMPT_END"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          include_fix_links: "false"
+          allowed_bots: ${{ inputs.allowed_bots }}
+          claude_args: >-
+            --max-turns ${{ needs.tier0.outputs.max_turns }}
+            --model ${{ needs.tier0.outputs.model }}
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Read"
+
+      - name: Build confirmation prompt
+        id: vote_prompt
+        if: ${{ inputs.voting }}
+        env:
+          MODE: vote
+          SECURITY: "false"
+          CYCLE: ${{ needs.tier0.outputs.cycle }}
+          MAX_CYCLES: ${{ inputs.max_cycles }}
+          DIFF_BASE: ${{ needs.tier0.outputs.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          {
+            echo "text<<REVIEW_SUITE_PROMPT_END"
+            bash .code-review-suite/scripts/build-prompt.sh
+            echo "REVIEW_SUITE_PROMPT_END"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Confirm findings
+        if: ${{ inputs.voting }}
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ steps.vote_prompt.outputs.text }}
+          include_fix_links: "false"
+          allowed_bots: ${{ inputs.allowed_bots }}
+          claude_args: >-
+            --max-turns 4
+            --model ${{ needs.tier0.outputs.model }}
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr view:*),Read"
+
+  summary:
+    name: summary
+    needs: [tier0, llm]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write summary
+        env:
+          PREP_RESULT: ${{ needs.tier0.result }}
+          LLM_RESULT: ${{ needs.llm.result }}
+          MODE: ${{ needs.tier0.outputs.mode }}
+          REASON: ${{ needs.tier0.outputs.reason }}
+          RISK: ${{ needs.tier0.outputs.risk }}
+          SENSITIVE: ${{ needs.tier0.outputs.sensitive }}
+          HUMAN: ${{ needs.tier0.outputs.human_required }}
+          REASONS: ${{ needs.tier0.outputs.reasons }}
+          MAX_CYCLES: ${{ inputs.max_cycles }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Code review suite"
+            echo
+            echo "- Tier 0: ${PREP_RESULT}"
+            echo "- Risk: ${RISK:-unknown} (sensitive: ${SENSITIVE:-unknown})"
+            echo "- Human required: ${HUMAN:-unknown}"
+            echo "- Reasons: ${REASONS:-none}"
+            echo "- Model step: ${MODE:-not-run} (${REASON:-none}, result ${LLM_RESULT})"
+            echo
+            case "${MODE:-}" in
+              skip-no-key)
+                echo "Model review was skipped because ANTHROPIC_API_KEY is not set. Tier 0 still ran."
+                ;;
+              skip-cycle-cap)
+                echo "Review stopped after ${MAX_CYCLES} cycles. Reconsider the approach instead of pushing another fix."
+                ;;
+              skip-draft)
+                echo "Draft pull request. The model runs when it is marked ready, or when review_drafts is true."
+                ;;
+              skip-no-pr)
+                echo "The model runs on pull_request events. Tier 0 still ran."
+                ;;
+              quick|deep)
+                echo "Model review ran in ${MODE} mode."
+                ;;
+              *)
+                echo "Model review did not run."
+                ;;
+            esac
+            echo
+            echo "This check does not approve the pull request. A bot approval never counts as a human review."
+            if [[ "${SENSITIVE:-}" == "true" || "${HUMAN:-}" == "true" ]]; then
+              echo "A human has to review this change."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
