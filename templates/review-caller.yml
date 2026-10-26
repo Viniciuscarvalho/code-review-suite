@@ -1,0 +1,26 @@
+# Copy this file to .github/workflows/review.yml in the consumer repo.
+# The uses: line is the whole integration. secrets: inherit passes ANTHROPIC_API_KEY
+# through when the repo has it, and the suite skips the model when it does not.
+name: Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Uncomment this block only when this caller already sets its own permissions.
+# The reusable workflow asks for these scopes. A caller that leaves permissions
+# unset inherits them.
+# permissions:
+#   contents: read
+#   pull-requests: write
+#   issues: read
+#   id-token: write
+
+jobs:
+  review:
+    uses: Viniciuscarvalho/code-review-suite/.github/workflows/review.yml@main
+    secrets: inherit
+    # with:
+    #   allowed_bots: your-code-bot[bot]
+    #   cheap_model: claude-haiku-5-5
+    #   strong_model: claude-sonnet-5-5

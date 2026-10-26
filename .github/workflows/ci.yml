@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh scripts/tests/*.sh evals/validate.sh
+
+      - name: Tests
+        run: bash scripts/tests/run.sh
+
+      - name: Install actionlint
+        run: |
+          curl -fsSL -o /tmp/actionlint.tar.gz -L https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          sudo tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint
+
+      - name: Workflow syntax
+        run: actionlint -color
